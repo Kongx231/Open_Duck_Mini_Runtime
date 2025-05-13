@@ -18,6 +18,14 @@ from mini_bdx_runtime.duck_config import DuckConfig
 
 import os
 
+# TODO: we probably want a common package to hold this, not copy and pasted. This is just for prototyping for now.
+from common.contact_aided_invariant_ekf.contact_aided_invariant_ekf import (
+    RightInEKF,
+)
+from common.contact_aided_invariant_ekf.robot_state import RobotState
+from common.contact_aided_invariant_ekf.noise_params import NoiseParams
+from common.contact_aided_invariant_ekf.drake_kinematics import DrakeKinematics
+
 HOME_DIR = os.path.expanduser("~")
 
 
@@ -25,6 +33,7 @@ class RLWalk:
     def __init__(
         self,
         onnx_model_path: str,
+        urdf_model_path: str,
         duck_config_path: str = f"{HOME_DIR}/duck_config.json",
         serial_port: str = "/dev/ttyACM0",
         control_freq: float = 50,
@@ -119,8 +128,47 @@ class RLWalk:
             )
         if self.duck_config.antennas:
             self.antennas = Antennas()
+        # TODO: InEKF, lots of settings should be from config. Prototyping for now.
 
-    def get_obs(self):
+        # Generic origin for the IMU when the duck is at initial position.
+        initial_pose = np.array([[1, 0,  0, -0.08],
+                                [0,  1,  0,  0],
+                                [0,  0,  1,  0.27],
+                                [0,  0,  0,  1]])
+
+        # Convert to rotation matrix
+        body_rotation_matrix = initial_pose[0:3, 0:3]
+        self.ekf_noise_params = NoiseParams() # TODO: put in real
+        # self.ekf_noise_params.set_gyroscope_bias_noise(1e-6)
+        # ekf_noise_params.set_contact_noise(0.5)
+        ekf_robot_state = RobotState()
+        ekf_robot_state.set_position(initial_pose[0:3, 3])
+        ekf_robot_state.set_rotation(body_rotation_matrix)
+        ekf_robot_state.set_velocity(np.zeros(3))
+        self._ekf = RightInEKF(ekf_robot_state, self.ekf_noise_params)
+
+        # Define the forward kinematics source.
+        self.drake_kinematics = DrakeKinematics(
+            imu_frame_name="imu",
+            urdf_model_path=urdf_model_path,
+            end_effector_frame_name_to_id_map={
+                "foot_assembly": 0,
+                "foot_assembly_2": 1,
+            },
+            # From URDF assembly to foot. And then add additional padding from foot link to bottom of foot.
+            end_effector_offset_map={
+                "foot_assembly": [0.0005, -0.036225 - 0.008, 0.01955],
+                "foot_assembly_2": [0.0005, -0.036225 - 0.008, 0.01955],
+            },
+        )
+
+        self.mask = np.zeros(
+            len(self.drake_kinematics.joint_name_to_idx_map), dtype=int
+        )
+        for name, idx in self.drake_kinematics.joint_name_to_idx_map.items():
+            self.mask[idx] = self.hwi.actuator_name_to_idx_map[name]
+
+    def get_obs(self, correct_kin: bool = True):
 
         imu_data = self.imu.get_data()
 
@@ -149,16 +197,57 @@ class RLWalk:
             print(f"ERROR len(dof_vel) != {self.num_dofs}")
             return None
 
+        dof_pos_corrected = dof_pos - self.init_pos
         cmds = self.last_commands
 
         feet_contacts = self.feet_contacts.get()
 
+        # Apply EKF
+        ekf_imu_measurement = np.zeros(6)
+        ekf_imu_measurement[0:3] = imu_data["gyro"]
+        ekf_imu_measurement[3:6] = imu_data["accelero"]
+
+        self._ekf.propagate(
+            self.ekf_imu_measurement_prev,  # use previous measurement.
+            dt=self.control_freq,
+        )
+
+        # Update prev sim time
+        self.ekf_imu_measurement_prev = ekf_imu_measurement.copy()
+
+        ekf_contact_measurement = [(idx, feet_contacts[idx]) for idx in range(len(feet_contacts))]
+        self._ekf.set_contacts(ekf_contact_measurement)
+        # TODO: grab uncertainty from the servos.
+        joint_uncertainty = 1e-3
+        feet_to_kinematics_map = self.drake_kinematics.compute_kinematics(
+            dof_pos_corrected[self.mask],
+            joint_uncertainty * np.eye(self.num_dofs),
+        )
+
+        if correct_kin:
+            self._ekf.correct_kinematics(
+                measured_kinematics=list(feet_to_kinematics_map.values())
+            )
+
+        estimated_state = self._ekf.get_state()
+
+        rotation_world = estimated_state.get_rotation()
+        floating_base_vel_world = estimated_state.get_velocity()
+
+        # TODO: use this when we move to path frame.
+        translation_world = estimated_state.get_position()
+
+        # Only use 6D rotation, not full 9D.
+        rotation_world_6d = rotation_world[:, 0:2].flatten()
+        floating_base_vel_body = rotation_world.T @ floating_base_vel_world[0:3]
         obs = np.concatenate(
             [
+                rotation_world_6d,
+                floating_base_vel_body,
                 imu_data["gyro"],
                 imu_data["accelero"],
                 cmds,
-                dof_pos - self.init_pos,
+                dof_pos_corrected,
                 dof_vel * 0.05,
                 self.last_action,
                 self.last_last_action,
@@ -249,11 +338,14 @@ class RLWalk:
                 if self.paused:
                     time.sleep(0.1)
                     continue
-
-                obs = self.get_obs()
+                
+                # Applying kinematic correction doesn't need to happen every single timestep. Lower the rate if running slowly.
+                obs = self.get_obs(
+                    correct_kin=True
+                )
                 if obs is None:
                     continue
-
+                
                 self.imitation_i += 1 * (
                     self.phase_frequency_factor + self.phase_frequency_factor_offset
                 )
@@ -268,6 +360,11 @@ class RLWalk:
                         ),
                     ]
                 )
+
+                magic_number = 45 + 6 + 3 # 6d pose, lin vel
+                self.obs_history = np.roll(self.obs_history, magic_number)
+                self.obs_history[:magic_number] = obs
+                obs = self.obs_history
 
                 if self.save_obs:
                     self.saved_obs.append(obs)
@@ -375,6 +472,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
 
+    parser.add_argument(
+        "--urdf_model_path",
+        type=str,
+        required=True
+    )
+
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
 
@@ -390,6 +493,7 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        urdf_model_path = args.urdf_model_path
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

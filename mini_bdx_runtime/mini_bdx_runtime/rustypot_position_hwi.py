@@ -76,6 +76,13 @@ class HWI:
 
         self.io = rustypot.feetech(usb_port, 1000000)
 
+        # Index in the array that comes out
+        self.actuator_name_to_idx_map = {}
+        current_joint_idx = 0
+        for key in self.joints:
+            self.actuator_name_to_idx_map[key] = current_joint_idx  
+            current_joint_idx += 1
+
     def set_kps(self, kps):
         self.kps = kps
         self.io.set_kps(list(self.joints.values()), self.kps)
